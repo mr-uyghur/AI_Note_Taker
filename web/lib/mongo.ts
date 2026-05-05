@@ -22,6 +22,7 @@ export async function getMongoClient(): Promise<MongoClient> {
   }
   const client = createClient();
   await client.connect();
+  await client.db('admin').command({ ping: 1 });
   return client;
 }
 
