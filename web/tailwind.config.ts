@@ -15,8 +15,9 @@ const config: Config = {
         border:  'var(--border)',
         default: 'var(--text)',
         muted:   'var(--text-muted)',
-        accent:  'var(--accent)',
-        danger:  'var(--danger)',
+        accent:       'var(--accent)',
+        'accent-hover': 'var(--accent-hover)',
+        danger:       'var(--danger)',
       },
       borderColor: {
         DEFAULT: 'var(--border)',
