@@ -9,11 +9,14 @@ pub fn verify_admin(
     username: String,
     password: String,
     state: State<AuthState>,
-) -> bool {
-    let expected_user = std::env::var("ADMIN_USERNAME").unwrap_or_default();
-    let expected_pass = std::env::var("ADMIN_PASSWORD").unwrap_or_default();
+) -> Result<bool, String> {
+    let expected_user = std::env::var("ADMIN_USERNAME")
+        .map_err(|_| "ADMIN_USERNAME is not configured".to_string())?;
+    let expected_pass = std::env::var("ADMIN_PASSWORD")
+        .map_err(|_| "ADMIN_PASSWORD is not configured".to_string())?;
 
-    // Constant-time comparison using XOR fold to prevent early exit
+    // XOR-fold comparison: no short-circuit on content, constant time for equal-length inputs.
+    // Note: length difference is still observable via timing; acceptable for a local single-admin app.
     let user_ok = constant_time_eq(username.as_bytes(), expected_user.as_bytes());
     let pass_ok = constant_time_eq(password.as_bytes(), expected_pass.as_bytes());
 
@@ -21,7 +24,7 @@ pub fn verify_admin(
     if ok {
         state.0.store(true, Ordering::SeqCst);
     }
-    ok
+    Ok(ok)
 }
 
 #[tauri::command]
@@ -29,8 +32,6 @@ pub fn is_authenticated(state: State<AuthState>) -> bool {
     state.0.load(Ordering::SeqCst)
 }
 
-/// XOR-fold constant-time equality (no short-circuit, no timing leak on equal-length inputs).
-/// Returns true only if both slices are equal in length AND content.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;

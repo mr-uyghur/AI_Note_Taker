@@ -33,8 +33,9 @@ export function Login({ onSuccess }: { onSuccess: () => void }) {
 
         <form onSubmit={handleSubmit} className="flex flex-col gap-4">
           <div className="flex flex-col gap-1">
-            <label className="text-muted text-xs">Username</label>
+            <label htmlFor="username" className="text-muted text-xs">Username</label>
             <input
+              id="username"
               type="text"
               value={username}
               onChange={(e) => setUsername(e.target.value)}
@@ -45,8 +46,9 @@ export function Login({ onSuccess }: { onSuccess: () => void }) {
           </div>
 
           <div className="flex flex-col gap-1">
-            <label className="text-muted text-xs">Password</label>
+            <label htmlFor="password" className="text-muted text-xs">Password</label>
             <input
+              id="password"
               type="password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}

@@ -1,6 +1,6 @@
-type Status = 'idle' | 'recording' | 'uploading' | 'transcribing' | 'done' | 'error';
+import type { RecorderStatus } from '../lib/types';
 
-const labels: Record<Status, string> = {
+const labels: Record<RecorderStatus, string> = {
   idle: 'Ready',
   recording: 'Recording',
   uploading: 'Uploading',
@@ -9,7 +9,7 @@ const labels: Record<Status, string> = {
   error: 'Error',
 };
 
-const colors: Record<Status, string> = {
+const colors: Record<RecorderStatus, string> = {
   idle: 'bg-muted/20 text-muted',
   recording: 'bg-danger/20 text-danger',
   uploading: 'bg-accent/20 text-accent',
@@ -18,7 +18,7 @@ const colors: Record<Status, string> = {
   error: 'bg-danger/20 text-danger',
 };
 
-export function StatusPill({ status }: { status: Status }) {
+export function StatusPill({ status }: { status: RecorderStatus }) {
   return (
     <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium ${colors[status]}`}>
       {status === 'recording' && (

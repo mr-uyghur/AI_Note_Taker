@@ -1,4 +1,5 @@
 import type { ButtonHTMLAttributes } from 'react';
+import { twMerge } from 'tailwind-merge';
 
 interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
   variant?: 'primary' | 'ghost' | 'danger';
@@ -16,7 +17,7 @@ export function Button({ variant = 'primary', size = 'md', className = '', child
 
   return (
     <button
-      className={`${base} ${sizes[size]} ${variants[variant]} ${className}`}
+      className={twMerge(base, sizes[size], variants[variant], className)}
       {...props}
     >
       {children}
