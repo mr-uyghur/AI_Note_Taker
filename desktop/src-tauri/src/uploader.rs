@@ -7,26 +7,32 @@ use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+#[derive(Clone)]
 pub struct UploadPart {
     pub part_number: i32,
     pub etag: String,
 }
 
+#[derive(Clone)]
 pub struct RecordingUpload {
     pub recording_id: String,
     pub upload_id: String,
     pub key: String,
     pub parts: Vec<UploadPart>,
     pub buffer: Vec<u8>,
+    /// Monotonically incrementing S3 part counter, independent of frontend chunk numbers.
+    pub next_part_number: i32,
 }
 
 pub type UploaderState = Arc<Mutex<HashMap<String, RecordingUpload>>>;
 
-pub fn make_s3_client() -> Client {
-    let account_id = std::env::var("R2_ACCOUNT_ID").expect("R2_ACCOUNT_ID not set");
-    let access_key = std::env::var("R2_ACCESS_KEY_ID").expect("R2_ACCESS_KEY_ID not set");
-    let secret_key = std::env::var("R2_SECRET_ACCESS_KEY").expect("R2_SECRET_ACCESS_KEY not set");
-    let _bucket = std::env::var("R2_BUCKET").unwrap_or_else(|_| "utter-recordings".to_string());
+pub fn make_s3_client() -> Result<Client, String> {
+    let account_id =
+        std::env::var("R2_ACCOUNT_ID").map_err(|_| "R2_ACCOUNT_ID not set".to_string())?;
+    let access_key =
+        std::env::var("R2_ACCESS_KEY_ID").map_err(|_| "R2_ACCESS_KEY_ID not set".to_string())?;
+    let secret_key = std::env::var("R2_SECRET_ACCESS_KEY")
+        .map_err(|_| "R2_SECRET_ACCESS_KEY not set".to_string())?;
 
     let creds = Credentials::new(&access_key, &secret_key, None, None, "env");
     let endpoint = format!("https://{}.r2.cloudflarestorage.com", account_id);
@@ -38,7 +44,7 @@ pub fn make_s3_client() -> Client {
         .force_path_style(false)
         .build();
 
-    Client::from_conf(config)
+    Ok(Client::from_conf(config))
 }
 
 pub async fn start_multipart(
@@ -95,7 +101,11 @@ pub async fn complete_multipart(
 ) -> Result<(), String> {
     use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 
-    let completed_parts: Vec<CompletedPart> = parts
+    // S3 requires parts in ascending part_number order.
+    let mut sorted_parts: Vec<&UploadPart> = parts.iter().collect();
+    sorted_parts.sort_by_key(|p| p.part_number);
+
+    let completed_parts: Vec<CompletedPart> = sorted_parts
         .iter()
         .map(|p| {
             CompletedPart::builder()

@@ -23,7 +23,7 @@ export async function POST(
 
   try {
     const db = await getDb();
-    await db.collection('recordings').updateOne(
+    const result = await db.collection('recordings').updateOne(
       { _id: new ObjectId(id) },
       {
         $set: {
@@ -35,6 +35,9 @@ export async function POST(
         },
       }
     );
+    if (result.matchedCount === 0) {
+      return NextResponse.json({ error: 'Recording not found' }, { status: 404 });
+    }
     return NextResponse.json({ ok: true });
   } catch (err) {
     console.error('POST /api/recordings/[id]/finalize', err);

@@ -11,12 +11,14 @@ export class WindowsRecorder {
   private partNumber = 1;
   private options: WindowsRecorderOptions;
   private stopped = false;
+  private audioCtx: AudioContext | null = null;
 
   constructor(options: WindowsRecorderOptions) {
     this.options = options;
   }
 
   async start(): Promise<void> {
+    if (this.stopped) throw new Error('WindowsRecorder cannot be restarted after stop()');
     // Get screen + system audio (Windows supports audio in getDisplayMedia)
     const displayStream = await navigator.mediaDevices.getDisplayMedia({
       video: { frameRate: 30 },
@@ -29,18 +31,18 @@ export class WindowsRecorder {
     });
 
     // Mix audio tracks via Web Audio API
-    const audioCtx = new AudioContext();
-    const dest = audioCtx.createMediaStreamDestination();
+    this.audioCtx = new AudioContext();
+    const dest = this.audioCtx.createMediaStreamDestination();
 
     const displayAudioTracks = displayStream.getAudioTracks();
     if (displayAudioTracks.length > 0) {
-      const displaySource = audioCtx.createMediaStreamSource(
+      const displaySource = this.audioCtx.createMediaStreamSource(
         new MediaStream(displayAudioTracks)
       );
       displaySource.connect(dest);
     }
 
-    const micSource = audioCtx.createMediaStreamSource(micStream);
+    const micSource = this.audioCtx.createMediaStreamSource(micStream);
     micSource.connect(dest);
 
     // Combine video track with mixed audio
@@ -58,7 +60,7 @@ export class WindowsRecorder {
     });
 
     this.mediaRecorder.ondataavailable = async (event) => {
-      if (event.data.size === 0 || this.stopped) return;
+      if (event.data.size === 0) return;
       try {
         const bytes = Array.from(new Uint8Array(await event.data.arrayBuffer()));
         await invoke('upload_chunk', {
@@ -78,10 +80,14 @@ export class WindowsRecorder {
 
   async stop(_durationSec: number): Promise<void> {
     this.stopped = true;
-    return new Promise((resolve) => {
+    await new Promise<void>((resolve) => {
       if (!this.mediaRecorder) { resolve(); return; }
       this.mediaRecorder.onstop = () => resolve();
       this.mediaRecorder.stop();
     });
+    if (this.audioCtx) {
+      await this.audioCtx.close();
+      this.audioCtx = null;
+    }
   }
 }
