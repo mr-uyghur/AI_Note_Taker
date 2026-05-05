@@ -14,6 +14,9 @@ export default {
         'accent-hover': 'var(--accent-hover)',
         danger:         'var(--danger)',
       },
+      borderColor: {
+        DEFAULT: 'var(--border)',
+      },
     },
   },
   plugins: [],

@@ -1,4 +1,5 @@
-import type { ObjectId } from 'mongodb';
+// IDs are string (hex ObjectId) in the shared layer.
+// The web server converts to/from ObjectId at the DB boundary.
 
 export type TranscriptSegment = {
   start: number;
@@ -21,12 +22,12 @@ export type Transcript = {
 export type ConversationMessage = {
   role: 'user' | 'assistant';
   content: string;
-  createdAt: Date;
+  createdAt: string; // ISO 8601 — JSON-serializable
 };
 
 export type Conversation = {
-  _id: ObjectId;
-  createdAt: Date;
+  _id: string;
+  createdAt: string; // ISO 8601
   title: string;
   messages: ConversationMessage[];
 };
@@ -34,9 +35,9 @@ export type Conversation = {
 export type RecordingStatus = 'uploading' | 'transcribing' | 'ready' | 'failed';
 
 export type Recording = {
-  _id: ObjectId;
+  _id: string;
   title: string;
-  createdAt: Date;
+  createdAt: string; // ISO 8601
   durationSec: number;
   sizeBytes: number;
   videoKey: string;
