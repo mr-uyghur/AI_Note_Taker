@@ -32,6 +32,11 @@ pub fn is_authenticated(state: State<AuthState>) -> bool {
     state.0.load(Ordering::SeqCst)
 }
 
+#[tauri::command]
+pub fn get_config(key: String) -> Result<String, String> {
+    std::env::var(&key).map_err(|_| format!("{} is not configured", key))
+}
+
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;

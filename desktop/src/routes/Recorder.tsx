@@ -3,12 +3,15 @@ import { invoke } from '@tauri-apps/api/core';
 import { Button } from '../components/ui/Button';
 import { StatusPill } from '../components/StatusPill';
 import type { RecorderStatus } from '../lib/types';
+import type { WindowsRecorder } from '../lib/recorder-windows';
 
 export function Recorder() {
   const [status, setStatus] = useState<RecorderStatus>('idle');
   const [elapsedSec, setElapsedSec] = useState(0);
   const [error, setError] = useState('');
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const recorderRef = useRef<WindowsRecorder | null>(null);
+  const recordingIdRef = useRef<string>('');
 
   useEffect(() => {
     return () => {
@@ -21,11 +24,46 @@ export function Recorder() {
     setError('');
     setElapsedSec(0);
     try {
-      await invoke('start_recording');
+      // Get config from Rust
+      const webBaseUrl = await invoke<string>('get_config', { key: 'WEB_BASE_URL' });
+      const internalToken = await invoke<string>('get_config', { key: 'INTERNAL_TOKEN' });
+
+      // Create recording stub in the web app
+      let res: Response;
+      try {
+        res = await fetch(`${webBaseUrl}/api/recordings`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${internalToken}`,
+          },
+          body: JSON.stringify({ title: `Recording — ${new Date().toLocaleString()}` }),
+        });
+      } catch (_fetchErr) {
+        throw new Error(
+          `Could not reach the web app at ${webBaseUrl}. Make sure the server is running.`
+        );
+      }
+
+      if (!res.ok) {
+        throw new Error(`Failed to create recording (HTTP ${res.status})`);
+      }
+      const { _id } = await res.json() as { _id: string };
+      recordingIdRef.current = _id;
+
+      // Init multipart upload in Rust
+      await invoke('init_recording', { recordingId: _id });
+
+      // Start MediaRecorder pipeline (Windows recorder for M4; macOS handled in M5)
+      const { WindowsRecorder } = await import('../lib/recorder-windows');
+      recorderRef.current = new WindowsRecorder({
+        recordingId: _id,
+        onError: (err) => setError(err.message),
+      });
+      await recorderRef.current.start();
+
       setStatus('recording');
-      timerRef.current = setInterval(() => {
-        setElapsedSec((s) => s + 1);
-      }, 1000);
+      timerRef.current = setInterval(() => setElapsedSec((s) => s + 1), 1000);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -38,7 +76,11 @@ export function Recorder() {
     }
     setStatus('uploading');
     try {
-      await invoke('stop_recording');
+      await recorderRef.current?.stop(elapsedSec);
+      await invoke('finalize_recording', {
+        recordingId: recordingIdRef.current,
+        durationSec: elapsedSec,
+      });
       setStatus('done');
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : String(err));

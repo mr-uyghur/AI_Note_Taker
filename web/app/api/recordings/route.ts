@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { ObjectId } from 'mongodb';
 import { getDb } from '@/lib/mongo';
+import { env } from '@/lib/env';
 
 function serializeDoc(r: Record<string, unknown>) {
   return {
@@ -35,6 +36,12 @@ export async function GET() {
 }
 
 export async function POST(request: Request) {
+  // Verify internal token from the desktop app
+  const auth = request.headers.get('Authorization');
+  if (auth !== `Bearer ${env.INTERNAL_TOKEN}`) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+
   try {
     const body = (await request.json()) as { title?: string };
     const db = await getDb();
