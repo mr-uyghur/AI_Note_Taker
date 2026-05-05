@@ -1,0 +1,25 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg-base:     #0a0a0b;
+  --bg-panel:    #141416;
+  --bg-elevated: #1c1c1f;
+  --border:      #2a2a2e;
+  --text:        #e6e6e8;
+  --text-muted:  #9a9aa0;
+  --accent:      #5e6ad2;
+  --accent-hover:#7378d6;
+  --danger:      #e5484d;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  background-color: var(--bg-base);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', sans-serif;
+}
