@@ -8,5 +8,6 @@ export async function POST() {
   const cookieStore = await cookies();
   const session = await getIronSession<SessionData>(cookieStore, sessionOptions);
   session.destroy();
+  await session.save(); // writes the expired cookie so the browser clears it
   return NextResponse.json({ ok: true });
 }

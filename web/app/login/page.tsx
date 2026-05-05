@@ -37,7 +37,7 @@ export default function LoginPage() {
 
   return (
     <div className="min-h-screen bg-base flex items-center justify-center">
-      <div className="bg-panel border border-[var(--border)] rounded-lg p-8 w-full max-w-sm">
+      <div className="bg-panel border border-border rounded-lg p-8 w-full max-w-sm">
         <h1 className="text-default text-xl font-semibold mb-6 tracking-tight">Utter</h1>
 
         <form onSubmit={handleSubmit} className="flex flex-col gap-4">
@@ -52,7 +52,7 @@ export default function LoginPage() {
               onChange={(e) => setUsername(e.target.value)}
               required
               autoComplete="username"
-              className="bg-elev border border-[var(--border)] rounded px-3 py-2 text-default text-sm outline-none focus:border-[var(--accent)] transition-colors"
+              className="bg-elev border border-border rounded px-3 py-2 text-default text-sm outline-none focus:border-accent transition-colors"
             />
           </div>
 
@@ -67,7 +67,7 @@ export default function LoginPage() {
               onChange={(e) => setPassword(e.target.value)}
               required
               autoComplete="current-password"
-              className="bg-elev border border-[var(--border)] rounded px-3 py-2 text-default text-sm outline-none focus:border-[var(--accent)] transition-colors"
+              className="bg-elev border border-border rounded px-3 py-2 text-default text-sm outline-none focus:border-accent transition-colors"
             />
           </div>
 
@@ -78,7 +78,7 @@ export default function LoginPage() {
           <button
             type="submit"
             disabled={loading}
-            className="bg-accent hover:bg-[var(--accent-hover)] text-white rounded px-4 py-2 text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            className="bg-accent hover:bg-accent-hover text-white rounded px-4 py-2 text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {loading ? 'Signing in…' : 'Sign in'}
           </button>

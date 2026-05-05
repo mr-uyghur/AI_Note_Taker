@@ -12,7 +12,7 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
 
   return (
     <div className="min-h-screen bg-base">
-      <header className="h-12 border-b border-[var(--border)] flex items-center justify-between px-6">
+      <header className="h-12 border-b border-border flex items-center justify-between px-6">
         <span className="text-default font-semibold tracking-tight">Utter</span>
         <button
           onClick={handleLogout}
