@@ -3,6 +3,13 @@ import { ObjectId } from 'mongodb';
 import { getDb } from '@/lib/mongo';
 import { env } from '@/lib/env';
 
+function kickTranscription(id: string) {
+  fetch(`${env.WEB_BASE_URL}/api/recordings/${id}/transcribe`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${env.INTERNAL_TOKEN}` },
+  }).catch((err) => console.error('kickTranscription', err));
+}
+
 export async function POST(
   request: Request,
   { params }: { params: Promise<{ id: string }> }
@@ -38,6 +45,7 @@ export async function POST(
     if (result.matchedCount === 0) {
       return NextResponse.json({ error: 'Recording not found' }, { status: 404 });
     }
+    kickTranscription(id);
     return NextResponse.json({ ok: true });
   } catch (err) {
     console.error('POST /api/recordings/[id]/finalize', err);
