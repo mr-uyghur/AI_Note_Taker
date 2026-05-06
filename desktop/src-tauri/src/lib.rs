@@ -1,5 +1,4 @@
 mod auth;
-mod recorder;
 mod recorder_windows;
 #[cfg(target_os = "macos")]
 mod recorder_macos;
@@ -35,8 +34,6 @@ fn run_app() {
             auth::verify_admin,
             auth::is_authenticated,
             auth::get_config,
-            recorder::start_recording,
-            recorder::stop_recording,
             recorder_macos::init_recording_macos,
             recorder_macos::stop_recording_macos,
         ])
@@ -60,8 +57,6 @@ fn run_app() {
             auth::verify_admin,
             auth::is_authenticated,
             auth::get_config,
-            recorder::start_recording,
-            recorder::stop_recording,
             recorder_windows::init_recording,
             recorder_windows::upload_chunk,
             recorder_windows::finalize_recording,

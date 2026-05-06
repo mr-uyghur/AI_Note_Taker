@@ -166,6 +166,7 @@ pub async fn init_recording_macos(
                 parts: Vec::new(),
                 buffer: Vec::new(),
                 next_part_number: 1,
+                total_bytes: 0,
             },
         );
         uploads.insert(
@@ -177,6 +178,7 @@ pub async fn init_recording_macos(
                 parts: Vec::new(),
                 buffer: Vec::new(),
                 next_part_number: 1,
+                total_bytes: 0,
             },
         );
     }

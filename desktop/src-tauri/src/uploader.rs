@@ -22,6 +22,8 @@ pub struct RecordingUpload {
     pub buffer: Vec<u8>,
     /// Monotonically incrementing S3 part counter, independent of frontend chunk numbers.
     pub next_part_number: i32,
+    /// Cumulative bytes received across all chunks.
+    pub total_bytes: u64,
 }
 
 pub type UploaderState = Arc<Mutex<HashMap<String, RecordingUpload>>>;

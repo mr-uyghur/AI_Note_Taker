@@ -30,6 +30,7 @@ pub async fn init_recording(
             parts: Vec::new(),
             buffer: Vec::new(),
             next_part_number: 1,
+            total_bytes: 0,
         },
     );
 
@@ -50,6 +51,7 @@ pub async fn upload_chunk(
     let (upload_id, key, should_upload, data, s3_part_number) = {
         let mut uploads = state.lock().map_err(|e| e.to_string())?;
         let upload = uploads.get_mut(&recording_id).ok_or("Recording not found")?;
+        upload.total_bytes += bytes.len() as u64;
         upload.buffer.extend_from_slice(&bytes);
 
         if upload.buffer.len() >= MIN_PART_SIZE {
@@ -89,7 +91,7 @@ pub async fn finalize_recording(
     let internal_token = std::env::var("INTERNAL_TOKEN").unwrap_or_default();
 
     // Extract data without removing from the map — removal happens only on success.
-    let (upload_id, key, buffer, mut parts, final_part_number) = {
+    let (upload_id, key, buffer, mut parts, final_part_number, total_bytes) = {
         let uploads = state.lock().map_err(|e| e.to_string())?;
         let upload = uploads.get(&recording_id).ok_or("Recording not found")?;
         let final_part_number = upload.next_part_number;
@@ -99,6 +101,7 @@ pub async fn finalize_recording(
             upload.buffer.clone(),
             upload.parts.clone(),
             final_part_number,
+            upload.total_bytes,
         )
     };
 
@@ -126,7 +129,7 @@ pub async fn finalize_recording(
     complete_multipart(&client, &bucket, &key, &upload_id, &parts).await?;
 
     // Notify the web app and check the HTTP response status.
-    let size_bytes = 0u64; // placeholder; actual size from S3 response is complex to extract here
+    let size_bytes = total_bytes;
     let client_http = reqwest::Client::new();
     let resp = client_http
         .post(format!(
