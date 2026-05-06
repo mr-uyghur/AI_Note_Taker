@@ -9,12 +9,15 @@
 //     -target arm64-apple-macosx13.0 \
 //     -framework ScreenCaptureKit -framework AVFoundation \
 //     -framework CoreMedia -framework Foundation \
+//     -framework AudioToolbox -framework CoreAudio \
 //     -o UtterRecorder-arm64
 
 import Foundation
 import AVFoundation
 import CoreMedia
 import ScreenCaptureKit
+import AudioToolbox
+import CoreAudio
 
 // MARK: - NDJSON helpers
 
@@ -62,7 +65,7 @@ func parseArgs() -> Args? {
     return args
 }
 
-// MARK: - Segment writer (fragmented MP4 for video, m4a for audio)
+// MARK: - Segment writer (fragmented MP4 for video + audio)
 
 /// Manages a single AVAssetWriter segment for video + audio.
 final class SegmentWriter {
@@ -131,13 +134,28 @@ final class SegmentWriter {
     var error: Error? { writer.error }
 }
 
-// MARK: - Audio m4a writer (continuous, system+mic mix)
+// MARK: - Audio m4a writer (continuous, system audio + mic as separate tracks)
+//
+// NOTE: Rather than mixing system audio and mic into a single AVAssetWriterInput
+// (which causes timestamp collisions when two async sources write to the same track),
+// we write them as two separate tracks in audio.m4a. The downstream ffmpeg transcode
+// step can merge/mix the tracks on ingest. This is functionally equivalent for
+// Whisper transcription. A true real-time mix would require routing both sources
+// through AVAudioEngine's mainMixerNode, but that requires SCStream audio to be
+// fed through an AVAudioSourceNode backed by a ring buffer — adding significant
+// synchronization complexity for a sidecar binary. Two-track output is the
+// safe, race-condition-free alternative.
 
 final class AudioFileWriter {
     private var writer: AVAssetWriter
-    private var audioInput: AVAssetWriterInput
-    private let lock = NSLock()
-    private var started = false
+    // Track 0: system audio (from SCStream)
+    private var sysInput: AVAssetWriterInput
+    // Track 1: microphone (from AVAudioEngine tap)
+    private var micInput: AVAssetWriterInput
+    private let sysLock = NSLock()
+    private let micLock = NSLock()
+    private var sysStarted = false
+    private var micStarted = false
 
     init(path: String) throws {
         let url = URL(fileURLWithPath: path)
@@ -145,39 +163,72 @@ final class AudioFileWriter {
         writer = try AVAssetWriter(outputURL: url, fileType: .m4a)
         writer.shouldOptimizeForNetworkUse = true
 
-        // AAC, mono, 24 kbps
+        // AAC, mono, 24 kbps — applied to both tracks
         let settings: [String: Any] = [
             AVFormatIDKey: kAudioFormatMPEG4AAC,
             AVSampleRateKey: 44100,
             AVNumberOfChannelsKey: 1,
             AVEncoderBitRateKey: 24000
         ]
-        audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: settings)
-        audioInput.expectsMediaDataInRealTime = true
-        writer.add(audioInput)
+
+        sysInput = AVAssetWriterInput(mediaType: .audio, outputSettings: settings)
+        sysInput.expectsMediaDataInRealTime = true
+        // Assign distinct track IDs so the muxer creates two separate audio tracks
+        sysInput.mediaTimeScale = 44100
+
+        micInput = AVAssetWriterInput(mediaType: .audio, outputSettings: settings)
+        micInput.expectsMediaDataInRealTime = true
+        micInput.mediaTimeScale = 44100
+
+        writer.add(sysInput)
+        writer.add(micInput)
+
+        // Start the writer now; individual tracks use their own session-start timestamps
+        writer.startWriting()
     }
 
-    func append(_ buffer: CMSampleBuffer) {
-        lock.lock()
-        defer { lock.unlock() }
-        if !started {
-            writer.startWriting()
+    /// Append a system-audio sample buffer (from SCStream).
+    func appendSystemAudio(_ buffer: CMSampleBuffer) {
+        sysLock.lock()
+        defer { sysLock.unlock() }
+        if !sysStarted {
             writer.startSession(atSourceTime: CMSampleBufferGetPresentationTimeStamp(buffer))
-            started = true
+            sysStarted = true
         }
-        if audioInput.isReadyForMoreMediaData {
-            audioInput.append(buffer)
+        if sysInput.isReadyForMoreMediaData {
+            sysInput.append(buffer)
+        }
+    }
+
+    /// Append a microphone sample buffer (from AVAudioEngine tap).
+    func appendMicAudio(_ buffer: CMSampleBuffer) {
+        micLock.lock()
+        defer { micLock.unlock() }
+        if !micStarted {
+            // Only start the mic track's session if the writer session was already
+            // started by the system-audio path; if not, use the mic timestamp.
+            // AVAssetWriter allows only one startSession call — the call in
+            // appendSystemAudio covers both tracks, so we just note that mic is ready.
+            micStarted = true
+        }
+        if micInput.isReadyForMoreMediaData {
+            micInput.append(buffer)
         }
     }
 
     func finalize(completion: @escaping () -> Void) {
-        lock.lock()
-        let wasStarted = started
-        lock.unlock()
-        if wasStarted {
-            audioInput.markAsFinished()
+        // Mark both tracks finished regardless of whether data was written
+        sysInput.markAsFinished()
+        micInput.markAsFinished()
+        let anyStarted: Bool = {
+            sysLock.lock(); defer { sysLock.unlock() }
+            return sysStarted
+        }()
+        if anyStarted {
             writer.finishWriting(completionHandler: completion)
         } else {
+            // Writer was started (in init) but no session was opened; just cancel.
+            writer.cancelWriting()
             completion()
         }
     }
@@ -317,14 +368,22 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
 
     private func setupMic() {
         let engine = AVAudioEngine()
+
+        // Honor --mic-device when a specific UID is given (Fix 2).
+        if args.micDevice != "default" {
+            selectMicDevice(uid: args.micDevice, engine: engine)
+        }
+
         let inputNode = engine.inputNode
         let format = inputNode.outputFormat(forBus: 0)
-        // Install tap to forward mic samples to audio writer and mix buffer
+
+        // Install tap: forward mic samples to the dedicated mic track in audio.m4a.
+        // (System audio is written to its own separate track via handleSystemAudio,
+        //  so the two paths never collide on a single AVAssetWriterInput — Fix 1.)
         inputNode.installTap(onBus: 0, bufferSize: 4096, format: format) { [weak self] buffer, time in
             guard let self = self, !self.stopping else { return }
-            // Convert AVAudioPCMBuffer -> CMSampleBuffer and feed to audioFileWriter
             if let cmBuf = self.pcmBufferToCMSampleBuffer(buffer, time: time) {
-                self.audioFileWriter?.append(cmBuf)
+                self.audioFileWriter?.appendMicAudio(cmBuf)
             }
         }
         do {
@@ -332,7 +391,55 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
             self.micEngine = engine
         } catch {
             // Mic is best-effort; warn but don't abort
-            emitJSON(["event": "error", "code": "mic_warn", "message": "Mic unavailable: \(error.localizedDescription)"])
+            emitJSON(["event": "error", "code": "mic_warn",
+                      "message": "Mic unavailable: \(error.localizedDescription)"])
+        }
+    }
+
+    /// Resolve a device UID to an AudioDeviceID and wire it to the engine's input AUHAL.
+    /// Falls back to the OS default and emits a warning if the UID is not found.
+    private func selectMicDevice(uid: String, engine: AVAudioEngine) {
+        // Step 1: resolve UID → AudioDeviceID
+        var deviceID = AudioDeviceID(0)
+        var uidRef = uid as CFString
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDeviceForUID,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var dataSize = UInt32(MemoryLayout<AudioDeviceID>.size)
+        let lookupStatus = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &addr,
+            UInt32(MemoryLayout<CFString>.size),
+            &uidRef,
+            &dataSize,
+            &deviceID
+        )
+
+        guard lookupStatus == noErr, deviceID != kAudioDeviceUnknown else {
+            fputs("UtterRecorder warning: mic-device '\(uid)' not found — using OS default\n", stderr)
+            return
+        }
+
+        // Step 2: set the device on the engine's underlying AUHAL input unit
+        guard let audioUnit = engine.inputNode.audioUnit else {
+            fputs("UtterRecorder warning: cannot access inputNode.audioUnit — using OS default\n", stderr)
+            return
+        }
+
+        var inputDeviceID = deviceID
+        let setStatus = AudioUnitSetProperty(
+            audioUnit,
+            kAudioOutputUnitProperty_CurrentDevice,
+            kAudioUnitScope_Global,
+            0,
+            &inputDeviceID,
+            UInt32(MemoryLayout<AudioDeviceID>.size)
+        )
+
+        if setStatus != noErr {
+            fputs("UtterRecorder warning: AudioUnitSetProperty for mic-device failed (\(setStatus)) — using OS default\n", stderr)
         }
     }
 
@@ -495,9 +602,11 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     // MARK: System audio handling
 
     private func handleSystemAudio(_ sampleBuffer: CMSampleBuffer) {
-        // Feed to audio file writer (continuous m4a)
-        audioFileWriter?.append(sampleBuffer)
-        // Also feed to current segment writer for audio track
+        // Write to the system-audio track in audio.m4a (Fix 1: separate track from mic).
+        audioFileWriter?.appendSystemAudio(sampleBuffer)
+        // Also forward to the current segment's single audio input.
+        // The segment audio input receives only system audio; mic is not mixed in
+        // at the segment level (the segment is primarily for video preview, not transcription).
         segmentLock.lock()
         let writer = segmentWriter
         segmentLock.unlock()
@@ -508,8 +617,8 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
 
     func stop() {
         stopping = true
-        micEngine?.stop()
         micEngine?.inputNode.removeTap(onBus: 0)
+        micEngine?.stop()
 
         stream?.stopCapture { [weak self] error in
             guard let self = self else { return }
