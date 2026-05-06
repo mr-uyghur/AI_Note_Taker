@@ -21,6 +21,7 @@ fn run_app() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_os::init())
         .manage(AuthState(std::sync::Arc::new(
             std::sync::atomic::AtomicBool::new(false),
         )))
@@ -48,6 +49,7 @@ fn run_app() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_os::init())
         .manage(AuthState(std::sync::Arc::new(
             std::sync::atomic::AtomicBool::new(false),
         )))

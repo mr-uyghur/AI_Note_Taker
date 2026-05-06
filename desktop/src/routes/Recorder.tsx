@@ -1,16 +1,20 @@
 import { useState, useRef, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { platform } from '@tauri-apps/plugin-os';
+import { openUrl } from '@tauri-apps/plugin-opener';
 import { Button } from '../components/ui/Button';
 import { StatusPill } from '../components/StatusPill';
 import type { RecorderStatus } from '../lib/types';
-import type { WindowsRecorder } from '../lib/recorder-windows';
+
+type AnyRecorder = { stop: (durationSec: number) => Promise<void> };
 
 export function Recorder() {
   const [status, setStatus] = useState<RecorderStatus>('idle');
   const [elapsedSec, setElapsedSec] = useState(0);
   const [error, setError] = useState('');
+  const [needsPermission, setNeedsPermission] = useState(false);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const recorderRef = useRef<WindowsRecorder | null>(null);
+  const recorderRef = useRef<AnyRecorder | null>(null);
   const recordingIdRef = useRef<string>('');
 
   useEffect(() => {
@@ -22,7 +26,9 @@ export function Recorder() {
   async function handleStart() {
     if (status === 'recording') return;
     setError('');
+    setNeedsPermission(false);
     setElapsedSec(0);
+
     try {
       // Get config from Rust
       const webBaseUrl = await invoke<string>('get_config', { key: 'WEB_BASE_URL' });
@@ -39,7 +45,7 @@ export function Recorder() {
           },
           body: JSON.stringify({ title: `Recording — ${new Date().toLocaleString()}` }),
         });
-      } catch (_fetchErr) {
+      } catch {
         throw new Error(
           `Could not reach the web app at ${webBaseUrl}. Make sure the server is running.`
         );
@@ -51,16 +57,36 @@ export function Recorder() {
       const { _id } = await res.json() as { _id: string };
       recordingIdRef.current = _id;
 
-      // Init multipart upload in Rust
-      await invoke('init_recording', { recordingId: _id });
-
-      // Start MediaRecorder pipeline (Windows recorder for M4; macOS handled in M5)
-      const { WindowsRecorder } = await import('../lib/recorder-windows');
-      recorderRef.current = new WindowsRecorder({
-        recordingId: _id,
-        onError: (err) => setError(err.message),
-      });
-      await recorderRef.current.start();
+      // Platform-specific recorder
+      const os = await platform();
+      if (os === 'macos') {
+        const { MacosRecorder } = await import('../lib/recorder-macos');
+        const recorder = new MacosRecorder({
+          recordingId: _id,
+          onError: (e) => setError(e.message),
+        });
+        try {
+          await recorder.start(); // invokes init_recording_macos
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (msg.toLowerCase().includes('permission')) {
+            setNeedsPermission(true);
+            return;
+          }
+          throw err;
+        }
+        recorderRef.current = recorder;
+      } else {
+        // Windows / other — existing path
+        await invoke('init_recording', { recordingId: _id });
+        const { WindowsRecorder } = await import('../lib/recorder-windows');
+        const recorder = new WindowsRecorder({
+          recordingId: _id,
+          onError: (e) => setError(e.message),
+        });
+        await recorder.start();
+        recorderRef.current = recorder;
+      }
 
       setStatus('recording');
       timerRef.current = setInterval(() => setElapsedSec((s) => s + 1), 1000);
@@ -76,11 +102,16 @@ export function Recorder() {
     }
     setStatus('uploading');
     try {
+      const os = await platform();
       await recorderRef.current?.stop(elapsedSec);
-      await invoke('finalize_recording', {
-        recordingId: recordingIdRef.current,
-        durationSec: elapsedSec,
-      });
+      if (os !== 'macos') {
+        // Windows: finalize is a separate Rust command
+        await invoke('finalize_recording', {
+          recordingId: recordingIdRef.current,
+          durationSec: elapsedSec,
+        });
+      }
+      // macOS: stop_recording_macos already handles finalization
       setStatus('done');
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : String(err));
@@ -92,6 +123,30 @@ export function Recorder() {
     const m = Math.floor(sec / 60).toString().padStart(2, '0');
     const s = (sec % 60).toString().padStart(2, '0');
     return `${m}:${s}`;
+  }
+
+  // Permission panel
+  if (needsPermission) {
+    return (
+      <div className="min-h-screen bg-base flex flex-col items-center justify-center gap-6 p-8 text-center">
+        <p className="text-default text-sm max-w-xs">
+          Utter needs permission to record your screen. Grant access in System Settings, then try again.
+        </p>
+        <div className="flex gap-3">
+          <Button
+            variant="ghost"
+            onClick={() =>
+              openUrl('x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture')
+            }
+          >
+            Open Privacy Settings
+          </Button>
+          <Button onClick={() => { setNeedsPermission(false); handleStart(); }}>
+            Try Again
+          </Button>
+        </div>
+      </div>
+    );
   }
 
   return (
