@@ -51,12 +51,13 @@ pub async fn start_multipart(
     client: &Client,
     bucket: &str,
     key: &str,
+    content_type: &str,
 ) -> Result<String, String> {
     let output = client
         .create_multipart_upload()
         .bucket(bucket)
         .key(key)
-        .content_type("video/webm")
+        .content_type(content_type)
         .send()
         .await
         .map_err(|e| e.to_string())?;

@@ -1,0 +1,432 @@
+use crate::uploader::{
+    complete_multipart, make_s3_client, start_multipart, upload_part, RecordingUpload,
+    UploadPart, UploaderState,
+};
+use bytes::Bytes;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use tauri::State;
+use tauri_plugin_shell::ShellExt;
+
+const MIN_PART_SIZE: usize = 5 * 1024 * 1024; // 5 MiB — S3 multipart minimum
+
+// ---------------------------------------------------------------------------
+// Supervisor state
+// ---------------------------------------------------------------------------
+
+pub struct MacosRecorderHandle {
+    pub child: Arc<Mutex<Option<tauri_plugin_shell::process::CommandChild>>>,
+    pub out_dir: std::path::PathBuf,
+    pub video_key: String,
+    pub audio_key: String,
+    pub start_time: std::time::Instant,
+}
+
+pub type MacosRecorderState = Arc<Mutex<HashMap<String, MacosRecorderHandle>>>;
+
+// ---------------------------------------------------------------------------
+// Internal helper: buffer data and upload a part when buffer >= MIN_PART_SIZE
+// ---------------------------------------------------------------------------
+
+async fn upload_fragment(
+    uploader_state: &UploaderState,
+    bucket: &str,
+    recording_id: &str,
+    suffix: &str, // "video" or "audio"
+    data: Bytes,
+) -> Result<(), String> {
+    let state_key = format!("{}_{}", recording_id, suffix);
+
+    // Extend the buffer; if it exceeds the minimum part size, drain and upload.
+    let to_upload: Option<(String, String, i32, Bytes)> = {
+        let mut uploads = uploader_state.lock().map_err(|e| e.to_string())?;
+        let u = uploads
+            .get_mut(&state_key)
+            .ok_or_else(|| format!("Upload not found: {}", state_key))?;
+        u.buffer.extend_from_slice(&data);
+
+        if u.buffer.len() >= MIN_PART_SIZE {
+            let pn = u.next_part_number;
+            u.next_part_number += 1;
+            let chunk = Bytes::from(u.buffer.drain(..).collect::<Vec<u8>>());
+            Some((u.upload_id.clone(), u.key.clone(), pn, chunk))
+        } else {
+            None
+        }
+    };
+
+    if let Some((upload_id, key, part_number, chunk)) = to_upload {
+        let client = make_s3_client()?;
+        let etag = upload_part(&client, bucket, &key, &upload_id, part_number, chunk).await?;
+
+        let mut uploads = uploader_state.lock().map_err(|e| e.to_string())?;
+        if let Some(u) = uploads.get_mut(&state_key) {
+            u.parts.push(UploadPart { part_number, etag });
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Helper: flush the remaining buffer as the final part and complete the upload
+// ---------------------------------------------------------------------------
+
+async fn finalize_upload(
+    uploader_state: &UploaderState,
+    bucket: &str,
+    state_key: &str,
+) -> Result<u64, String> {
+    let (upload_id, key, buffer, mut parts, final_part_number) = {
+        let uploads = uploader_state.lock().map_err(|e| e.to_string())?;
+        let u = uploads
+            .get(state_key)
+            .ok_or_else(|| format!("Upload not found: {}", state_key))?;
+        (
+            u.upload_id.clone(),
+            u.key.clone(),
+            u.buffer.clone(),
+            u.parts.clone(),
+            u.next_part_number,
+        )
+    };
+
+    let size_bytes = buffer.len() as u64;
+    let client = make_s3_client()?;
+
+    // Flush remaining buffer as final part (last part may be any size).
+    if !buffer.is_empty() {
+        let data = Bytes::from(buffer);
+        let etag =
+            upload_part(&client, bucket, &key, &upload_id, final_part_number, data).await?;
+        parts.push(UploadPart {
+            part_number: final_part_number,
+            etag,
+        });
+    }
+
+    // S3 requires at least one completed part — guard for empty uploads.
+    if parts.is_empty() {
+        return Err(format!("No parts to complete for {}", state_key));
+    }
+
+    complete_multipart(&client, bucket, &key, &upload_id, &parts).await?;
+
+    // Remove from state.
+    let mut uploads = uploader_state.lock().map_err(|e| e.to_string())?;
+    uploads.remove(state_key);
+
+    Ok(size_bytes)
+}
+
+// ---------------------------------------------------------------------------
+// Command: init_recording_macos
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn init_recording_macos(
+    recording_id: String,
+    app: tauri::AppHandle,
+    uploader_state: State<'_, UploaderState>,
+    recorder_state: State<'_, MacosRecorderState>,
+) -> Result<(), String> {
+    let bucket = std::env::var("R2_BUCKET").unwrap_or_else(|_| "utter-recordings".to_string());
+
+    let video_key = format!("recordings/{}/video.mp4", recording_id);
+    let audio_key = format!("recordings/{}/audio.m4a", recording_id);
+
+    // Create temp output directory with a video/ sub-directory.
+    let out_dir = std::env::temp_dir().join(format!("utter_{}", recording_id));
+    std::fs::create_dir_all(out_dir.join("video")).map_err(|e| e.to_string())?;
+
+    // Start multipart uploads.
+    let client = make_s3_client()?;
+    let video_upload_id =
+        start_multipart(&client, &bucket, &video_key, "video/mp4").await?;
+    let audio_upload_id =
+        start_multipart(&client, &bucket, &audio_key, "audio/mp4").await?;
+
+    // Register both uploads in shared uploader state.
+    {
+        let mut uploads = uploader_state.lock().map_err(|e| e.to_string())?;
+        uploads.insert(
+            format!("{}_video", recording_id),
+            RecordingUpload {
+                recording_id: recording_id.clone(),
+                upload_id: video_upload_id,
+                key: video_key.clone(),
+                parts: Vec::new(),
+                buffer: Vec::new(),
+                next_part_number: 1,
+            },
+        );
+        uploads.insert(
+            format!("{}_audio", recording_id),
+            RecordingUpload {
+                recording_id: recording_id.clone(),
+                upload_id: audio_upload_id,
+                key: audio_key.clone(),
+                parts: Vec::new(),
+                buffer: Vec::new(),
+                next_part_number: 1,
+            },
+        );
+    }
+
+    // Spawn the UtterRecorder sidecar.
+    let out_dir_str = out_dir
+        .to_str()
+        .ok_or_else(|| "Invalid out_dir path".to_string())?
+        .to_string();
+    let (mut rx, child) = app
+        .shell()
+        .sidecar("UtterRecorder")
+        .map_err(|e| e.to_string())?
+        .args([
+            "--out-dir",
+            &out_dir_str,
+            "--display-id",
+            "0",
+            "--mic-device",
+            "default",
+        ])
+        .spawn()
+        .map_err(|e| e.to_string())?;
+
+    // Store the handle.
+    {
+        let mut state = recorder_state.lock().map_err(|e| e.to_string())?;
+        state.insert(
+            recording_id.clone(),
+            MacosRecorderHandle {
+                child: Arc::new(Mutex::new(Some(child))),
+                out_dir,
+                video_key,
+                audio_key,
+                start_time: std::time::Instant::now(),
+            },
+        );
+    }
+
+    // Clone what we need to move into the tokio task.
+    let uploader_state_clone = uploader_state.inner().clone();
+    let recording_id_clone = recording_id.clone();
+    let bucket_clone = bucket.clone();
+
+    // Spawn a background task to read NDJSON events from the sidecar stdout.
+    tokio::spawn(async move {
+        use tauri_plugin_shell::process::CommandEvent;
+
+        while let Some(event) = rx.recv().await {
+            match event {
+                CommandEvent::Stdout(line_bytes) => {
+                    let line = String::from_utf8_lossy(&line_bytes);
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+
+                    let parsed: serde_json::Value = match serde_json::from_str(trimmed) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("[UtterRecorder] JSON parse error: {} — line: {}", e, trimmed);
+                            continue;
+                        }
+                    };
+
+                    let event_type = parsed["event"].as_str().unwrap_or("");
+
+                    match event_type {
+                        "started" => {
+                            eprintln!(
+                                "[UtterRecorder] started, pid={}",
+                                parsed["pid"].as_i64().unwrap_or(-1)
+                            );
+                        }
+                        "chunk" => {
+                            let kind = parsed["kind"].as_str().unwrap_or("");
+                            let path = parsed["path"].as_str().unwrap_or("");
+                            let seq = parsed["seq"].as_i64().unwrap_or(-1);
+
+                            if kind == "video" {
+                                match std::fs::read(path) {
+                                    Ok(bytes) => {
+                                        let data = Bytes::from(bytes);
+                                        if let Err(e) = upload_fragment(
+                                            &uploader_state_clone,
+                                            &bucket_clone,
+                                            &recording_id_clone,
+                                            "video",
+                                            data,
+                                        )
+                                        .await
+                                        {
+                                            eprintln!(
+                                                "[UtterRecorder] upload_fragment error (seq={}): {}",
+                                                seq, e
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "[UtterRecorder] failed to read chunk (seq={}, path={}): {}",
+                                            seq, path, e
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        "stopped" => {
+                            eprintln!("[UtterRecorder] sidecar reported stopped");
+                            break;
+                        }
+                        "error" => {
+                            eprintln!(
+                                "[UtterRecorder] error — code={}, message={}",
+                                parsed["code"].as_str().unwrap_or("?"),
+                                parsed["message"].as_str().unwrap_or("?")
+                            );
+                        }
+                        other => {
+                            eprintln!("[UtterRecorder] unknown event: {}", other);
+                        }
+                    }
+                }
+                CommandEvent::Stderr(line_bytes) => {
+                    eprintln!(
+                        "[UtterRecorder stderr] {}",
+                        String::from_utf8_lossy(&line_bytes).trim()
+                    );
+                }
+                CommandEvent::Terminated(status) => {
+                    eprintln!(
+                        "[UtterRecorder] process terminated, code={:?}",
+                        status.code
+                    );
+                    break;
+                }
+                _ => {}
+            }
+        }
+    });
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Command: stop_recording_macos
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn stop_recording_macos(
+    recording_id: String,
+    uploader_state: State<'_, UploaderState>,
+    recorder_state: State<'_, MacosRecorderState>,
+) -> Result<(), String> {
+    let bucket = std::env::var("R2_BUCKET").unwrap_or_else(|_| "utter-recordings".to_string());
+    let web_base_url =
+        std::env::var("WEB_BASE_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
+    let internal_token = std::env::var("INTERNAL_TOKEN").unwrap_or_default();
+
+    // Retrieve and remove the handle.
+    let handle = {
+        let mut state = recorder_state.lock().map_err(|e| e.to_string())?;
+        state
+            .remove(&recording_id)
+            .ok_or_else(|| format!("No recording found for id: {}", recording_id))?
+    };
+
+    let duration_sec = handle.start_time.elapsed().as_secs() as u32;
+    let out_dir = handle.out_dir.clone();
+    let video_key = handle.video_key.clone();
+    let audio_key = handle.audio_key.clone();
+
+    // Signal the sidecar to stop and wait briefly for it to finalize.
+    {
+        let mut child_guard = handle.child.lock().map_err(|e| e.to_string())?;
+        if let Some(child) = child_guard.take() {
+            // kill() sends SIGTERM on Unix / TerminateProcess on Windows.
+            child.kill().map_err(|e| e.to_string())?;
+        }
+    }
+
+    // Give the sidecar up to 10 seconds to flush and exit.
+    // We use a simple poll rather than an async wait since tauri_plugin_shell
+    // does not expose a join() on the child after kill().
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let audio_path = out_dir.join("audio.m4a");
+    while std::time::Instant::now() < deadline {
+        if audio_path.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Finalize the video multipart upload.
+    // -----------------------------------------------------------------------
+    let video_bytes_flushed = finalize_upload(
+        uploader_state.inner(),
+        &bucket,
+        &format!("{}_video", recording_id),
+    )
+    .await?;
+
+    // -----------------------------------------------------------------------
+    // Upload the audio file.
+    // The sidecar writes audio.m4a continuously and finalises it on exit.
+    // -----------------------------------------------------------------------
+    let audio_data = std::fs::read(&audio_path).map_err(|e| {
+        format!("Failed to read audio.m4a ({}): {}", audio_path.display(), e)
+    })?;
+    let audio_size = audio_data.len() as u64;
+
+    // Feed the entire audio file into the buffer so finalize_upload can flush it.
+    {
+        let mut uploads = uploader_state.lock().map_err(|e| e.to_string())?;
+        let state_key = format!("{}_audio", recording_id);
+        if let Some(u) = uploads.get_mut(&state_key) {
+            u.buffer.extend_from_slice(&audio_data);
+        }
+    }
+
+    let _audio_bytes_flushed = finalize_upload(
+        uploader_state.inner(),
+        &bucket,
+        &format!("{}_audio", recording_id),
+    )
+    .await?;
+
+    let total_bytes = video_bytes_flushed + audio_size;
+
+    // -----------------------------------------------------------------------
+    // Notify the web app.
+    // -----------------------------------------------------------------------
+    let http_client = reqwest::Client::new();
+    let resp = http_client
+        .post(format!(
+            "{}/api/recordings/{}/finalize",
+            web_base_url, recording_id
+        ))
+        .header("Authorization", format!("Bearer {}", internal_token))
+        .json(&serde_json::json!({
+            "videoKey": video_key,
+            "audioKey": audio_key,
+            "durationSec": duration_sec,
+            "sizeBytes": total_bytes,
+        }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if !resp.status().is_success() {
+        return Err(format!("Finalize webhook failed: HTTP {}", resp.status()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Cleanup temp directory.
+    // -----------------------------------------------------------------------
+    let _ = std::fs::remove_dir_all(&out_dir);
+
+    Ok(())
+}

@@ -18,7 +18,7 @@ pub async fn init_recording(
     let key = format!("recordings/{}/video.webm", recording_id);
     let client = make_s3_client()?;
 
-    let upload_id = start_multipart(&client, &bucket, &key).await?;
+    let upload_id = start_multipart(&client, &bucket, &key, "video/webm").await?;
 
     let mut uploads = state.lock().map_err(|e| e.to_string())?;
     uploads.insert(
