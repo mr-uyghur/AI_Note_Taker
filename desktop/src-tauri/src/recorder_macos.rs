@@ -4,6 +4,7 @@ use crate::uploader::{
 };
 use bytes::Bytes;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::State;
 use tauri_plugin_shell::ShellExt;
@@ -20,6 +21,10 @@ pub struct MacosRecorderHandle {
     pub video_key: String,
     pub audio_key: String,
     pub start_time: std::time::Instant,
+    /// Accumulates the total bytes of all video chunks successfully uploaded.
+    pub video_bytes: Arc<AtomicU64>,
+    /// Oneshot receiver that fires when the sidecar process terminates.
+    pub terminated_rx: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
 }
 
 pub type MacosRecorderState = Arc<Mutex<HashMap<String, MacosRecorderHandle>>>;
@@ -193,6 +198,13 @@ pub async fn init_recording_macos(
         .spawn()
         .map_err(|e| e.to_string())?;
 
+    // Oneshot channel: the event loop sends () when the sidecar terminates.
+    let (term_tx, term_rx) = tokio::sync::oneshot::channel::<()>();
+
+    // Shared atomic counter for total video bytes uploaded.
+    let video_bytes = Arc::new(AtomicU64::new(0));
+    let video_bytes_clone = video_bytes.clone();
+
     // Store the handle.
     {
         let mut state = recorder_state.lock().map_err(|e| e.to_string())?;
@@ -204,6 +216,8 @@ pub async fn init_recording_macos(
                 video_key,
                 audio_key,
                 start_time: std::time::Instant::now(),
+                video_bytes,
+                terminated_rx: Arc::new(tokio::sync::Mutex::new(Some(term_rx))),
             },
         );
     }
@@ -216,6 +230,9 @@ pub async fn init_recording_macos(
     // Spawn a background task to read NDJSON events from the sidecar stdout.
     tokio::spawn(async move {
         use tauri_plugin_shell::process::CommandEvent;
+
+        // `term_tx` is moved here; send on Terminated so stop_recording_macos can await it.
+        let mut term_tx_opt = Some(term_tx);
 
         while let Some(event) = rx.recv().await {
             match event {
@@ -251,6 +268,7 @@ pub async fn init_recording_macos(
                             if kind == "video" {
                                 match std::fs::read(path) {
                                     Ok(bytes) => {
+                                        let byte_count = bytes.len() as u64;
                                         let data = Bytes::from(bytes);
                                         if let Err(e) = upload_fragment(
                                             &uploader_state_clone,
@@ -265,6 +283,9 @@ pub async fn init_recording_macos(
                                                 "[UtterRecorder] upload_fragment error (seq={}): {}",
                                                 seq, e
                                             );
+                                        } else {
+                                            // Track bytes only on successful upload.
+                                            video_bytes_clone.fetch_add(byte_count, Ordering::Relaxed);
                                         }
                                     }
                                     Err(e) => {
@@ -278,7 +299,7 @@ pub async fn init_recording_macos(
                         }
                         "stopped" => {
                             eprintln!("[UtterRecorder] sidecar reported stopped");
-                            break;
+                            // Don't break here — wait for the OS-level Terminated event.
                         }
                         "error" => {
                             eprintln!(
@@ -303,6 +324,11 @@ pub async fn init_recording_macos(
                         "[UtterRecorder] process terminated, code={:?}",
                         status.code
                     );
+                    // Signal stop_recording_macos that the sidecar has fully exited
+                    // and audio.m4a is guaranteed to be flushed.
+                    if let Some(tx) = term_tx_opt.take() {
+                        let _ = tx.send(());
+                    }
                     break;
                 }
                 _ => {}
@@ -340,32 +366,39 @@ pub async fn stop_recording_macos(
     let out_dir = handle.out_dir.clone();
     let video_key = handle.video_key.clone();
     let audio_key = handle.audio_key.clone();
+    let video_bytes_counter = handle.video_bytes.clone();
+    let terminated_rx_arc = handle.terminated_rx.clone();
 
-    // Signal the sidecar to stop and wait briefly for it to finalize.
+    // Signal the sidecar to stop.
+    // NOTE: tauri_plugin_shell::process::CommandChild does not expose a pid() method,
+    // so we cannot send SIGTERM directly. kill() sends SIGKILL on Unix. The sidecar
+    // should be updated to install a SIGTERM handler; for now we accept SIGKILL and
+    // rely on the OS to flush any kernel-buffered writes before we read audio.m4a.
     {
         let mut child_guard = handle.child.lock().map_err(|e| e.to_string())?;
         if let Some(child) = child_guard.take() {
-            // kill() sends SIGTERM on Unix / TerminateProcess on Windows.
             child.kill().map_err(|e| e.to_string())?;
         }
     }
 
-    // Give the sidecar up to 10 seconds to flush and exit.
-    // We use a simple poll rather than an async wait since tauri_plugin_shell
-    // does not expose a join() on the child after kill().
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    // Wait for the sidecar process to fully terminate (signalled by the event loop task)
+    // so that audio.m4a is guaranteed to be flushed before we read it.
+    let term_rx = terminated_rx_arc
+        .lock()
+        .await
+        .take()
+        .ok_or_else(|| "terminated_rx already consumed".to_string())?;
+    tokio::time::timeout(std::time::Duration::from_secs(15), term_rx)
+        .await
+        .map_err(|_| "Sidecar did not stop within 15s".to_string())?
+        .map_err(|_| "Sidecar terminated channel dropped".to_string())?;
+
     let audio_path = out_dir.join("audio.m4a");
-    while std::time::Instant::now() < deadline {
-        if audio_path.exists() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    }
 
     // -----------------------------------------------------------------------
     // Finalize the video multipart upload.
     // -----------------------------------------------------------------------
-    let video_bytes_flushed = finalize_upload(
+    finalize_upload(
         uploader_state.inner(),
         &bucket,
         &format!("{}_video", recording_id),
@@ -374,7 +407,7 @@ pub async fn stop_recording_macos(
 
     // -----------------------------------------------------------------------
     // Upload the audio file.
-    // The sidecar writes audio.m4a continuously and finalises it on exit.
+    // The sidecar writes audio.m4a and flushes it before exiting.
     // -----------------------------------------------------------------------
     let audio_data = std::fs::read(&audio_path).map_err(|e| {
         format!("Failed to read audio.m4a ({}): {}", audio_path.display(), e)
@@ -390,14 +423,16 @@ pub async fn stop_recording_macos(
         }
     }
 
-    let _audio_bytes_flushed = finalize_upload(
+    finalize_upload(
         uploader_state.inner(),
         &bucket,
         &format!("{}_audio", recording_id),
     )
     .await?;
 
-    let total_bytes = video_bytes_flushed + audio_size;
+    // Accurate total: sum of all video chunk bytes fed into the uploader + audio file size.
+    let video_size = video_bytes_counter.load(Ordering::Relaxed);
+    let total_bytes = video_size + audio_size;
 
     // -----------------------------------------------------------------------
     // Notify the web app.

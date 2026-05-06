@@ -36,9 +36,6 @@ fn run_app() {
             auth::get_config,
             recorder::start_recording,
             recorder::stop_recording,
-            recorder_windows::init_recording,
-            recorder_windows::upload_chunk,
-            recorder_windows::finalize_recording,
             recorder_macos::init_recording_macos,
             recorder_macos::stop_recording_macos,
         ])
