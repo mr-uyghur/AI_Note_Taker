@@ -4,7 +4,7 @@ use crate::uploader::{
 };
 use bytes::Bytes;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::State;
 use tauri_plugin_shell::ShellExt;
@@ -23,6 +23,9 @@ pub struct MacosRecorderHandle {
     pub start_time: std::time::Instant,
     /// Accumulates the total bytes of all video chunks successfully uploaded.
     pub video_bytes: Arc<AtomicU64>,
+    /// PID of the sidecar process, populated when the "started" NDJSON event arrives.
+    /// Stored as -1 until the event is received.
+    pub sidecar_pid: Arc<AtomicI32>,
     /// Oneshot receiver that fires when the sidecar process terminates.
     pub terminated_rx: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
 }
@@ -205,6 +208,10 @@ pub async fn init_recording_macos(
     let video_bytes = Arc::new(AtomicU64::new(0));
     let video_bytes_clone = video_bytes.clone();
 
+    // Shared atomic for the sidecar PID (set when "started" event arrives).
+    let sidecar_pid = Arc::new(AtomicI32::new(-1));
+    let sidecar_pid_clone = sidecar_pid.clone();
+
     // Store the handle.
     {
         let mut state = recorder_state.lock().map_err(|e| e.to_string())?;
@@ -217,6 +224,7 @@ pub async fn init_recording_macos(
                 audio_key,
                 start_time: std::time::Instant::now(),
                 video_bytes,
+                sidecar_pid,
                 terminated_rx: Arc::new(tokio::sync::Mutex::new(Some(term_rx))),
             },
         );
@@ -255,10 +263,11 @@ pub async fn init_recording_macos(
 
                     match event_type {
                         "started" => {
-                            eprintln!(
-                                "[UtterRecorder] started, pid={}",
-                                parsed["pid"].as_i64().unwrap_or(-1)
-                            );
+                            let pid = parsed["pid"].as_i64().unwrap_or(-1);
+                            if pid > 0 {
+                                sidecar_pid_clone.store(pid as i32, Ordering::Relaxed);
+                            }
+                            eprintln!("[UtterRecorder] started, pid={}", pid);
                         }
                         "chunk" => {
                             let kind = parsed["kind"].as_str().unwrap_or("");
@@ -369,15 +378,22 @@ pub async fn stop_recording_macos(
     let video_bytes_counter = handle.video_bytes.clone();
     let terminated_rx_arc = handle.terminated_rx.clone();
 
-    // Signal the sidecar to stop.
-    // NOTE: tauri_plugin_shell::process::CommandChild does not expose a pid() method,
-    // so we cannot send SIGTERM directly. kill() sends SIGKILL on Unix. The sidecar
-    // should be updated to install a SIGTERM handler; for now we accept SIGKILL and
-    // rely on the OS to flush any kernel-buffered writes before we read audio.m4a.
+    // Signal the sidecar to stop gracefully via SIGTERM so it can finalize audio.m4a.
+    // We use the PID extracted from the "started" NDJSON event rather than child.kill(),
+    // which would send SIGKILL and prevent the Swift AVAssetWriter from flushing.
+    #[cfg(target_os = "macos")]
     {
-        let mut child_guard = handle.child.lock().map_err(|e| e.to_string())?;
-        if let Some(child) = child_guard.take() {
-            child.kill().map_err(|e| e.to_string())?;
+        use nix::sys::signal::{kill, Signal};
+        use nix::unistd::Pid;
+        let pid = handle.sidecar_pid.load(Ordering::Relaxed);
+        if pid > 0 {
+            let _ = kill(Pid::from_raw(pid), Signal::SIGTERM);
+        } else {
+            // "started" event not yet received — fall back to SIGKILL.
+            let mut child_guard = handle.child.lock().map_err(|e| e.to_string())?;
+            if let Some(child) = child_guard.take() {
+                let _ = child.kill();
+            }
         }
     }
 
