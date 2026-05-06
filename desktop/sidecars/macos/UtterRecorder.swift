@@ -152,10 +152,8 @@ final class AudioFileWriter {
     private var sysInput: AVAssetWriterInput
     // Track 1: microphone (from AVAudioEngine tap)
     private var micInput: AVAssetWriterInput
-    private let sysLock = NSLock()
-    private let micLock = NSLock()
-    private var sysStarted = false
-    private var micStarted = false
+    private let writerLock = NSLock()
+    private var sessionStarted = false
 
     init(path: String) throws {
         let url = URL(fileURLWithPath: path)
@@ -189,11 +187,11 @@ final class AudioFileWriter {
 
     /// Append a system-audio sample buffer (from SCStream).
     func appendSystemAudio(_ buffer: CMSampleBuffer) {
-        sysLock.lock()
-        defer { sysLock.unlock() }
-        if !sysStarted {
+        writerLock.lock()
+        defer { writerLock.unlock() }
+        if !sessionStarted {
             writer.startSession(atSourceTime: CMSampleBufferGetPresentationTimeStamp(buffer))
-            sysStarted = true
+            sessionStarted = true
         }
         if sysInput.isReadyForMoreMediaData {
             sysInput.append(buffer)
@@ -201,15 +199,14 @@ final class AudioFileWriter {
     }
 
     /// Append a microphone sample buffer (from AVAudioEngine tap).
+    /// Uses the same writerLock and sessionStarted flag as appendSystemAudio so that
+    /// whichever source arrives first opens the session — fixing silent mic-only audio loss.
     func appendMicAudio(_ buffer: CMSampleBuffer) {
-        micLock.lock()
-        defer { micLock.unlock() }
-        if !micStarted {
-            // Only start the mic track's session if the writer session was already
-            // started by the system-audio path; if not, use the mic timestamp.
-            // AVAssetWriter allows only one startSession call — the call in
-            // appendSystemAudio covers both tracks, so we just note that mic is ready.
-            micStarted = true
+        writerLock.lock()
+        defer { writerLock.unlock() }
+        if !sessionStarted {
+            writer.startSession(atSourceTime: CMSampleBufferGetPresentationTimeStamp(buffer))
+            sessionStarted = true
         }
         if micInput.isReadyForMoreMediaData {
             micInput.append(buffer)
@@ -217,20 +214,18 @@ final class AudioFileWriter {
     }
 
     func finalize(completion: @escaping () -> Void) {
-        // Mark both tracks finished regardless of whether data was written
+        writerLock.lock()
+        let started = sessionStarted
         sysInput.markAsFinished()
         micInput.markAsFinished()
-        let anyStarted: Bool = {
-            sysLock.lock(); defer { sysLock.unlock() }
-            return sysStarted
-        }()
-        if anyStarted {
-            writer.finishWriting(completionHandler: completion)
-        } else {
-            // Writer was started (in init) but no session was opened; just cancel.
+        writerLock.unlock()
+
+        guard writer.status == .writing && started else {
             writer.cancelWriting()
             completion()
+            return
         }
+        writer.finishWriting(completionHandler: completion)
     }
 }
 
@@ -257,7 +252,13 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     private var micEngine: AVAudioEngine?
 
     // Stopping flag (written from SIGTERM / stopCapture callback, read from sample handler queue)
-    private var stopping = false
+    // Protected by NSLock to prevent data races under -O optimisation (compiler can hoist plain var reads).
+    private let stoppingLock = NSLock()
+    private var _stopping = false
+    private var stopping: Bool {
+        get { stoppingLock.withCriticalSection { _stopping } }
+        set { stoppingLock.withCriticalSection { _stopping = newValue } }
+    }
 
     // Video/audio settings reused across segments
     private var videoSettings: [String: Any] = [:]

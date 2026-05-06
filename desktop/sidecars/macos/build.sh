@@ -11,7 +11,8 @@ ARM64_BIN="$OUT_DIR/UtterRecorder-arm64"
 X86_BIN="$OUT_DIR/UtterRecorder-x86_64"
 UNIVERSAL="$OUT_DIR/UtterRecorder"
 
-FRAMEWORKS="-framework ScreenCaptureKit -framework AVFoundation -framework CoreMedia -framework Foundation"
+FRAMEWORKS="-framework ScreenCaptureKit -framework AVFoundation -framework CoreMedia \
+            -framework Foundation -framework AudioToolbox -framework CoreAudio"
 
 echo "==> Building UtterRecorder for arm64 (aarch64-apple-macosx13.0) …" >&2
 swiftc "$SRC" \
