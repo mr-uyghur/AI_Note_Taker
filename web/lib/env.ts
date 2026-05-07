@@ -4,7 +4,7 @@ const schema = z.object({
   ADMIN_USERNAME: z.string().min(1),
   ADMIN_PASSWORD: z.string().min(1),
   INTERNAL_TOKEN: z.string().min(1),
-  MONGODB_URI: z.string().url(),
+  MONGODB_URI: z.string().min(1),
   MONGODB_DB: z.string().min(1),
   SESSION_PASSWORD: z.string().min(32),
   GROQ_API_KEY: z.string().min(1),

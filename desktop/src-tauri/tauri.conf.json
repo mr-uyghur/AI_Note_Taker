@@ -31,12 +31,11 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "externalBin": ["../../sidecars/macos/UtterRecorder"]
+    "externalBin": []
   },
   "plugins": {
     "shell": {
-      "open": true,
-      "sidecar": true
+      "open": true
     }
   }
 }

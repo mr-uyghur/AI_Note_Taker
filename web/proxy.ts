@@ -4,8 +4,19 @@ import { getIronSession } from 'iron-session';
 import { sessionOptions } from './lib/auth';
 import type { SessionData } from './lib/auth';
 
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+};
+
 export async function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl;
+
+  // CORS preflight for API routes (Tauri webview is cross-origin)
+  if (request.method === 'OPTIONS' && pathname.startsWith('/api/')) {
+    return new NextResponse(null, { status: 200, headers: CORS_HEADERS });
+  }
 
   // Public routes — pass through without session check
   if (
@@ -21,6 +32,14 @@ export async function proxy(request: NextRequest) {
 
   // Protected: /admin and any API routes not under /api/auth
   if (pathname.startsWith('/admin') || pathname.startsWith('/api/')) {
+    // Desktop app authenticates with Bearer token — bypass session check
+    const auth = request.headers.get('Authorization');
+    if (auth && auth === `Bearer ${process.env.INTERNAL_TOKEN}`) {
+      const response = NextResponse.next();
+      Object.entries(CORS_HEADERS).forEach(([k, v]) => response.headers.set(k, v));
+      return response;
+    }
+
     const response = NextResponse.next();
     // iron-session v8: pass (req, res) for proxy/middleware context
     const session = await getIronSession<SessionData>(request, response, sessionOptions);

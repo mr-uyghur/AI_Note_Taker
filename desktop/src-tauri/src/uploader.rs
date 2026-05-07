@@ -28,6 +28,19 @@ pub struct RecordingUpload {
 
 pub type UploaderState = Arc<Mutex<HashMap<String, RecordingUpload>>>;
 
+/// Walk the full `Error::source()` chain so callers see the real reason
+/// instead of just the top-level variant tag (e.g. "service error").
+fn err_chain<E: std::error::Error>(e: E) -> String {
+    let mut s = e.to_string();
+    let mut src: Option<&dyn std::error::Error> = e.source();
+    while let Some(inner) = src {
+        s.push_str(": ");
+        s.push_str(&inner.to_string());
+        src = inner.source();
+    }
+    s
+}
+
 pub fn make_s3_client() -> Result<Client, String> {
     let account_id =
         std::env::var("R2_ACCOUNT_ID").map_err(|_| "R2_ACCOUNT_ID not set".to_string())?;
@@ -44,6 +57,7 @@ pub fn make_s3_client() -> Result<Client, String> {
         .region(Region::new("auto"))
         .endpoint_url(endpoint)
         .force_path_style(false)
+        .behavior_version_latest()
         .build();
 
     Ok(Client::from_conf(config))
@@ -62,7 +76,7 @@ pub async fn start_multipart(
         .content_type(content_type)
         .send()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(err_chain)?;
 
     output
         .upload_id()
@@ -87,7 +101,7 @@ pub async fn upload_part(
         .body(ByteStream::from(data))
         .send()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(err_chain)?;
 
     output
         .e_tag()
@@ -130,7 +144,7 @@ pub async fn complete_multipart(
         .multipart_upload(completed)
         .send()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(err_chain)?;
 
     Ok(())
 }
