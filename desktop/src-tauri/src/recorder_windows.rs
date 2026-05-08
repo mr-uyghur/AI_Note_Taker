@@ -1,8 +1,9 @@
 use crate::uploader::{
-    complete_multipart, make_s3_client, start_multipart, upload_part, RecordingUpload,
+    complete_multipart, err_chain, make_s3_client, start_multipart, upload_part, RecordingUpload,
     UploadPart, UploaderState,
 };
 use bytes::Bytes;
+use serde_json::{json, Value};
 use tauri::State;
 
 const MIN_PART_SIZE: usize = 5 * 1024 * 1024; // 5 MiB — S3 multipart minimum
@@ -155,4 +156,45 @@ pub async fn finalize_recording(
     uploads.remove(&recording_id);
 
     Ok(())
+}
+
+/// Diagnostic command: reports R2 config (sanitized) and probes the bucket with HeadBucket.
+/// Invoke from the UI to identify credential/bucket/connectivity issues without a full recording.
+#[tauri::command]
+pub async fn r2_diagnose() -> Result<Value, String> {
+    let account_id = std::env::var("R2_ACCOUNT_ID").unwrap_or_default();
+    let access_key = std::env::var("R2_ACCESS_KEY_ID").unwrap_or_default();
+    let secret_key = std::env::var("R2_SECRET_ACCESS_KEY").unwrap_or_default();
+    let bucket = std::env::var("R2_BUCKET").unwrap_or_else(|_| "utter-recordings".to_string());
+    let endpoint = if account_id.is_empty() {
+        "(R2_ACCOUNT_ID not set)".to_string()
+    } else {
+        format!("https://{}.r2.cloudflarestorage.com", account_id)
+    };
+
+    let config_snapshot = json!({
+        "R2_ACCOUNT_ID": if account_id.is_empty() { "NOT SET".to_string() } else { format!("set ({} chars)", account_id.len()) },
+        "R2_ACCESS_KEY_ID": if access_key.is_empty() { "NOT SET".to_string() } else { format!("{}… ({} chars)", &access_key[..access_key.len().min(4)], access_key.len()) },
+        "R2_SECRET_ACCESS_KEY": if secret_key.is_empty() { "NOT SET".to_string() } else { format!("set ({} chars)", secret_key.len()) },
+        "R2_BUCKET": bucket,
+        "endpoint": endpoint,
+    });
+
+    let client = match make_s3_client() {
+        Ok(c) => c,
+        Err(e) => {
+            return Ok(json!({ "config": config_snapshot, "headBucket": format!("client error: {}", e) }));
+        }
+    };
+
+    let head_result = client
+        .head_bucket()
+        .bucket(&bucket)
+        .send()
+        .await
+        .map(|_| "ok".to_string())
+        .map_err(err_chain)
+        .unwrap_or_else(|e| e);
+
+    Ok(json!({ "config": config_snapshot, "headBucket": head_result }))
 }

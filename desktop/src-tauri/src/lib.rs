@@ -60,6 +60,7 @@ fn run_app() {
             recorder_windows::init_recording,
             recorder_windows::upload_chunk,
             recorder_windows::finalize_recording,
+            recorder_windows::r2_diagnose,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -30,7 +30,7 @@ pub type UploaderState = Arc<Mutex<HashMap<String, RecordingUpload>>>;
 
 /// Walk the full `Error::source()` chain so callers see the real reason
 /// instead of just the top-level variant tag (e.g. "service error").
-fn err_chain<E: std::error::Error>(e: E) -> String {
+pub fn err_chain<E: std::error::Error>(e: E) -> String {
     let mut s = e.to_string();
     let mut src: Option<&dyn std::error::Error> = e.source();
     while let Some(inner) = src {

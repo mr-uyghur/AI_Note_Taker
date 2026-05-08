@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { platform } from '@tauri-apps/plugin-os';
 import { openUrl } from '@tauri-apps/plugin-opener';
@@ -13,6 +13,8 @@ export function Recorder() {
   const [elapsedSec, setElapsedSec] = useState(0);
   const [error, setError] = useState('');
   const [needsPermission, setNeedsPermission] = useState(false);
+  const [diagResult, setDiagResult] = useState<string | null>(null);
+  const [diagRunning, setDiagRunning] = useState(false);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const recorderRef = useRef<AnyRecorder | null>(null);
   const recordingIdRef = useRef<string>('');
@@ -119,6 +121,21 @@ export function Recorder() {
     }
   }
 
+  const handleDiagnose = useCallback(async () => {
+    setDiagRunning(true);
+    setDiagResult(null);
+    try {
+      const os = await platform();
+      if (os === 'macos') { setDiagResult('Diagnose only available on Windows.'); return; }
+      const result = await invoke('r2_diagnose');
+      setDiagResult(JSON.stringify(result, null, 2));
+    } catch (err: unknown) {
+      setDiagResult(String(err instanceof Error ? err.message : err));
+    } finally {
+      setDiagRunning(false);
+    }
+  }, []);
+
   function formatTime(sec: number) {
     const m = Math.floor(sec / 60).toString().padStart(2, '0');
     const s = (sec % 60).toString().padStart(2, '0');
@@ -187,6 +204,24 @@ export function Recorder() {
         </div>
 
         {error && <p className="text-danger text-xs max-w-xs text-center">{error}</p>}
+
+        {(error || diagResult) && (
+          <div className="flex flex-col items-center gap-2 w-full max-w-sm">
+            <Button
+              variant="ghost"
+              onClick={handleDiagnose}
+              disabled={diagRunning}
+              className="text-xs h-7 px-3"
+            >
+              {diagRunning ? 'Diagnosing…' : 'Diagnose R2'}
+            </Button>
+            {diagResult && (
+              <pre className="text-xs text-muted bg-surface rounded p-3 w-full overflow-auto max-h-48 text-left">
+                {diagResult}
+              </pre>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );
